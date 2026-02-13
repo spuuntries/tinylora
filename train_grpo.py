@@ -375,6 +375,10 @@ def main():
 
     if not args.no_gradient_checkpointing:
         base_model.gradient_checkpointing_enable()
+        # Gradient checkpointing requires at least one input with requires_grad=True.
+        # Since TinyLoRA freezes all base weights, we need to explicitly enable this
+        # on the input embeddings, otherwise backward() fails.
+        base_model.enable_input_require_grads()
         if accelerator.is_main_process:
             print("[TinyLoRA] Gradient checkpointing enabled")
 
