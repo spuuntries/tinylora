@@ -354,6 +354,8 @@ def main():
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
+    # Move model to GPU immediately to ensure SVD (in TinyLoRAModel) runs on GPU.
+    base_model.to(accelerator.device)
 
     if not args.no_gradient_checkpointing:
         base_model.gradient_checkpointing_enable()
