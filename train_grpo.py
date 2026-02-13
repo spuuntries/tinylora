@@ -5,14 +5,15 @@ A minimal implementation of GRPO for math reasoning, following the paper:
   "Learning to Reason in 13 Parameters" (2602.04118v1)
 
 Usage (fast iteration, 1.5B):
-    accelerate launch train_grpo.py \
+    accelerate launch --mixed_precision bf16 train_grpo.py \
         --model Qwen/Qwen2.5-1.5B-Instruct \
         --max_gen_len 512 \
         --max_seq_len 1024 \
         --batch_size 16 \
         --micro_batch_size 16 \
         --n_tie 560 \
-        --proj_dim 13
+        --proj_dim 13 \
+        --k 2 --compile
 
 Usage (full run, 7B on 2×A100):
     accelerate launch --mixed_precision bf16 train_grpo.py \
@@ -23,7 +24,7 @@ Usage (full run, 7B on 2×A100):
         --micro_batch_size 32 \
         --n_tie 196 \
         --proj_dim 13 \
-        --no_gradient_checkpointing
+        --k 2 --compile --no_gradient_checkpointing
 
 Usage (closer to paper (?) though some parts are a bit unclear tbh, 
             we'll see how it goes, lmk if u try it out! 
@@ -344,6 +345,8 @@ def main():
                         help="Micro batch size for GRPO loss computation")
     parser.add_argument("--eval_every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--compile", action="store_true",
+                        help="Use torch.compile for faster forward/backward")
     args = parser.parse_args()
     
     # Initialize Accelerator
@@ -395,6 +398,12 @@ def main():
         p.requires_grad = True
 
     optimizer = AdamW(model.trainable_parameters(), lr=args.lr)
+
+    # ── Compile for speed ──
+    if args.compile:
+        if accelerator.is_main_process:
+            print("[TinyLoRA] Compiling model with torch.compile...")
+        model = torch.compile(model)
 
     # ── Load data ──
     if accelerator.is_main_process:
