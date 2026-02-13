@@ -238,8 +238,17 @@ def compute_grpo_loss_step(
             # Mask padding in labels (usually pad_token_id is handled, but explicit mask is safer)
             mask = inputs["attention_mask"][:, 1:]
             
+            # Mask prompt tokens (we only want to train on the completion)
+            seq_len = labels.size(1)
+            range_inds = torch.arange(seq_len, device=device).unsqueeze(0)
+            # Mask indices < p_len - 1 (shifted by 1)
+            completion_mask = range_inds >= (batch_p_lens.unsqueeze(1) - 1)
+            
+            # Apply both padding mask and completion mask
+            active_mask = mask * completion_mask
+            
             # Sum log_probs per sequence (masked)
-            seq_log_probs = (token_log_probs * mask).sum(dim=-1)
+            seq_log_probs = (token_log_probs * active_mask).sum(dim=-1)
             
             # GRPO Loss: -1 * (log_prob * advantage)
             # We divide by micro_batch_size * accumulation_steps conceptually
