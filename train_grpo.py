@@ -345,16 +345,29 @@ def main():
     parser.add_argument("--micro_batch_size", type=int, default=4,
                         help="Micro batch size for GRPO loss computation")
     parser.add_argument("--eval_every", type=int, default=50)
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="tinylora-grpo",
+                        help="W&B project name (requires --wandb)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     
     # Initialize Accelerator
-    accelerator = Accelerator(gradient_accumulation_steps=1)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=1,
+        log_with="wandb" if args.wandb else None,
+    )
     
     if args.max_seq_len <= args.max_gen_len:
         raise ValueError(f"max_seq_len ({args.max_seq_len}) must be larger than max_gen_len ({args.max_gen_len})")
 
     set_seed(args.seed)
+
+    if args.wandb:
+        accelerator.init_trackers(
+            project_name=args.wandb_project,
+            config=vars(args),
+        )
 
     if accelerator.is_main_process:
         print(f"Device: {accelerator.device}")
@@ -499,12 +512,22 @@ def main():
                 if step % args.log_every == 0:
                     tqdm.write(f"[Step {step}] Loss: {avg_loss:.4f}  Avg reward: {avg_reward:.3f}")
 
+            if args.wandb:
+                accelerator.log({
+                    "loss": avg_loss,
+                    "reward": avg_reward,
+                    "epoch": epoch,
+                }, step=step)
+
     # ── Save ──
     accelerator.wait_for_everyone()
     
     if accelerator.is_main_process:
         raw_model.save_adapter(args.output_dir)
         print("Done!")
+
+    if args.wandb:
+        accelerator.end_training()
 
 
 if __name__ == "__main__":
