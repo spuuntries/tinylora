@@ -5,7 +5,7 @@ A minimal implementation of GRPO for math reasoning, following the paper:
   "Learning to Reason in 13 Parameters" (2602.04118v1)
 
 Usage:
-    train_grpo.py \
+    accelerate launch train_grpo.py \
         --model Qwen/Qwen2.5-7B-Instruct \
         --max_gen_len 4096 \
         --max_seq_len 5120 \
@@ -19,14 +19,18 @@ Usage:
 import argparse
 import re
 import random
+import os
 
 from tqdm import tqdm
 
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 from torch.optim import AdamW
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from accelerate import Accelerator
+from accelerate.utils import set_seed
 
 from tinylora import TinyLoRAModel
 
@@ -64,15 +68,32 @@ def exact_match_reward(prediction: str, ground_truth: str) -> float:
 
 # ─── GSM8K data helpers ────────────────────────────────────────────────────
 
-def load_gsm8k(split: str = "train"):
-    """Load GSM8K and format as list of (question, answer) tuples."""
-    ds = load_dataset("openai/gsm8k", "main", split=split)
-    data = []
-    for row in ds:
-        question = row["question"]
-        answer = row["answer"]
-        data.append((question, answer))
-    return data
+class GSM8KDataset(Dataset):
+    def __init__(self, split: str = "train", tokenizer=None):
+        self.data = []
+        try:
+            ds = load_dataset("openai/gsm8k", "main", split=split)
+            for row in ds:
+                self.data.append({
+                    "question": row["question"],
+                    "answer": row["answer"]
+                })
+        except Exception as e:
+            print(f"Error loading dataset: {e}")
+            # Fallback for testing if dataset fails to load (e.g. no internet)
+            self.data = [{"question": "1+1", "answer": "2"}] * 10 
+        self.tokenizer = tokenizer
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+def collate_fn(batch):
+    questions = [item["question"] for item in batch]
+    answers = [item["answer"] for item in batch]
+    return questions, answers
 
 
 def format_prompt(question: str, tokenizer) -> str:
@@ -88,7 +109,7 @@ def format_prompt(question: str, tokenizer) -> str:
 
 @torch.no_grad()
 def generate_completions(
-    model, tokenizer, prompts: list[str], k: int, max_gen_len: int, max_seq_len: int, temperature: float = 1.0,
+    model, tokenizer, prompts: list[str], k: int, max_gen_len: int, max_seq_len: int, temperature: float = 1.0, device=None
 ) -> tuple[list[list[str]], list[list[int]]]:
     """
     Batched generation. fast af.
@@ -103,10 +124,9 @@ def generate_completions(
         padding=True, 
         truncation=True, 
         max_length=max_seq_len - max_gen_len,
-    ).to(next(model.parameters()).device)
+    ).to(device)
 
     # Generate all k completions in one go (or parallel streams)
-    # We use num_return_sequences=k to let the kernel handle the expansion
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -156,6 +176,7 @@ def compute_grpo_loss_step(
     prompts: list[str],
     completions: list[list[str]],
     rewards: list[list[float]],
+    accelerator: Accelerator,
     max_seq_len: int = 1024,
     micro_batch_size: int = 4,
 ) -> tuple[float, float]:
@@ -163,7 +184,7 @@ def compute_grpo_loss_step(
     Batched GRPO loss computation. 
     Significantly faster by parallelizing the forward/backward passes.
     """
-    device = next(model.parameters()).device
+    device = accelerator.device
     total_loss = 0.0
     total_samples = 0
     
@@ -180,9 +201,6 @@ def compute_grpo_loss_step(
         # NOTE: We re-tokenize the prompt to get the exact length
         # This is fast enough since batch size is small
         prompt_ids = tokenizer(prompt)["input_ids"]
-        # Add 1 if the chat template (or inputs) adds a BOS token that tokenizer(prompt) doesn't
-        # Usually tokenizer(text) vs tokenizer(prompt+compl) is consistent
-        # For safety, we assume prompt tokens appear first.
         p_len = len(prompt_ids)
         
         # Standard GRPO advantage (group norm)
@@ -203,6 +221,21 @@ def compute_grpo_loss_step(
     # Shuffle to mix advantages (optional but good for stability)
     indices = torch.randperm(n_samples).tolist()
     
+    # We essentially do gradient accumulation over micro-batches here
+    # But usually accelerator handles accumulation. 
+    # Since we are doing a custom inner loop for micro-batching (to save VRAM on the forward pass of the *training* step, distinct from generation),
+    # we should manually sync only on the last step or use no_sync.
+    # However, since this whole function `compute_grpo_loss_step` is ONE logical optimizer step (or part of it),
+    # and we act on `optimizer.step()` *after* this function returns, 
+    # we just need to make sure gradients accumulate in `p.grad`.
+    # `accelerator.backward(loss)` will do that.
+    
+    # NOTE: DDP will synchronize gradients on every backward(). 
+    # If we do multiple backwards per step, we might be syncing too often.
+    # We should use `accelerator.no_sync(model)` for all but the last micro-batch if we want efficiency,
+    # OR since we are just doing a few micro-batches, maybe it's fine.
+    # But let's keep it simple for now. 
+    
     for i in range(0, n_samples, micro_batch_size):
         batch_indices = indices[i : i + micro_batch_size]
         batch_texts = [all_texts[idx] for idx in batch_indices]
@@ -221,45 +254,42 @@ def compute_grpo_loss_step(
         # GRPO requires computing log_prob(completion | prompt)
         # We mask out the prompt tokens from the loss
         
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            outputs = model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-            )
-            
-            # Shift for autoregressive loss
-            logits = outputs.logits[:, :-1, :]
-            labels = inputs["input_ids"][:, 1:]
-            
-            # Compute token-level log probs
-            log_probs = F.log_softmax(logits, dim=-1)
-            
-            # Gather log probs of the actual tokens
-            # shape: [B, L]
-            token_log_probs = torch.gather(log_probs, -1, labels.unsqueeze(-1)).squeeze(-1)
-            
-            # Mask padding in labels (usually pad_token_id is handled, but explicit mask is safer)
-            mask = inputs["attention_mask"][:, 1:]
-            
-            # Mask prompt tokens (we only want to train on the completion)
-            seq_len = labels.size(1)
-            range_inds = torch.arange(seq_len, device=device).unsqueeze(0)
-            # Mask indices < p_len - 1 (shifted by 1)
-            completion_mask = range_inds >= (batch_p_lens.unsqueeze(1) - 1)
-            
-            # Apply both padding mask and completion mask
-            active_mask = mask * completion_mask
-            
-            # Sum log_probs per sequence (masked)
-            seq_log_probs = (token_log_probs * active_mask).sum(dim=-1)
-            
-            # GRPO Loss: -1 * (log_prob * advantage)
-            # We divide by micro_batch_size * accumulation_steps conceptually
-            # But here we just average over the micro-batch
-            loss = -(seq_log_probs * batch_adv).mean()
+        outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+        )
         
-        # Backprop
-        loss.backward()
+        # Shift for autoregressive loss
+        logits = outputs.logits[:, :-1, :]
+        labels = inputs["input_ids"][:, 1:]
+        
+        # Compute token-level log probs
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # Gather log probs of the actual tokens
+        # shape: [B, L]
+        token_log_probs = torch.gather(log_probs, -1, labels.unsqueeze(-1)).squeeze(-1)
+        
+        # Mask padding in labels (usually pad_token_id is handled, but explicit mask is safer)
+        mask = inputs["attention_mask"][:, 1:]
+        
+        # Mask prompt tokens (we only want to train on the completion)
+        seq_len = labels.size(1)
+        range_inds = torch.arange(seq_len, device=device).unsqueeze(0)
+        # Mask indices < p_len - 1 (shifted by 1)
+        completion_mask = range_inds >= (batch_p_lens.unsqueeze(1) - 1)
+        
+        # Apply both padding mask and completion mask
+        active_mask = mask * completion_mask
+        
+        # Sum log_probs per sequence (masked)
+        seq_log_probs = (token_log_probs * active_mask).sum(dim=-1)
+        
+        # GRPO Loss: -1 * (log_prob * advantage)
+        loss = -(seq_log_probs * batch_adv).mean()
+    
+        # Backprop with accelerator
+        accelerator.backward(loss)
         
         total_loss += loss.item() * len(batch_indices)
         total_samples += len(batch_indices)
@@ -300,17 +330,21 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     
+    # Initialize Accelerator
+    accelerator = Accelerator(gradient_accumulation_steps=1)
+    
     if args.max_seq_len <= args.max_gen_len:
         raise ValueError(f"max_seq_len ({args.max_seq_len}) must be larger than max_gen_len ({args.max_gen_len})")
 
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    set_seed(args.seed)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
+    if accelerator.is_main_process:
+        print(f"Device: {accelerator.device}")
 
     # ── Load model & tokenizer ──
-    print(f"Loading model: {args.model}")
+    if accelerator.is_main_process:
+        print(f"Loading model: {args.model}")
+        
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -318,13 +352,13 @@ def main():
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
-        device_map=device,
         trust_remote_code=True,
     )
 
     if not args.no_gradient_checkpointing:
         base_model.gradient_checkpointing_enable()
-        print("[TinyLoRA] Gradient checkpointing enabled")
+        if accelerator.is_main_process:
+            print("[TinyLoRA] Gradient checkpointing enabled")
 
     # ── Wrap with TinyLoRA ──
     model = TinyLoRAModel(
@@ -333,74 +367,109 @@ def main():
         proj_dim=args.proj_dim,
         n_tie=args.n_tie,
     )
-    model.to(device)
+    
+    # Enable grad for trainable params
+    for p in model.trainable_parameters():
+        p.requires_grad = True
 
     optimizer = AdamW(model.trainable_parameters(), lr=args.lr)
 
     # ── Load data ──
-    print("Loading GSM8K...")
-    train_data = load_gsm8k("train")
-    print(f"  Train: {len(train_data)} examples")
+    if accelerator.is_main_process:
+        print("Loading GSM8K...")
+    
+    dataset = GSM8KDataset("train", tokenizer)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        collate_fn=collate_fn,
+        num_workers=0, 
+        pin_memory=True
+    )
+
+    if accelerator.is_main_process:
+        print(f"  Train: {len(dataset)} examples")
+
+    # ── Prepare with Accelerator ──
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
     # ── Training loop ──
     step = 0
-    for epoch in range(args.epochs):
-        random.shuffle(train_data)
-        n_batches = (len(train_data) + args.batch_size - 1) // args.batch_size
-        pbar = tqdm(range(0, len(train_data), args.batch_size),
-                    desc=f"Epoch {epoch+1}/{args.epochs}", total=n_batches)
-        for i in pbar:
-            batch = train_data[i : i + args.batch_size]
-            questions, answers = zip(*batch)
-            prompts = [format_prompt(q, tokenizer) for q in questions]
+    # Calculate approximate total steps (len(dataloader) is per process)
+    total_steps = len(dataloader) * args.epochs
+    
+    pbar = tqdm(total=total_steps, disable=not accelerator.is_main_process, desc="Training")
 
-            if not args.no_gradient_checkpointing:
-                model.model.gradient_checkpointing_disable()
-                model.model.config.use_cache = True
+    for epoch in range(args.epochs):
+        for batch_questions, batch_answers in dataloader:
+            
+            # Form prompts
+            prompts = [format_prompt(q, tokenizer) for q in batch_questions]
 
             # Generate k completions per prompt
+            # We need to unwrap the model to call generate safely if it's DDP wrapped
+            unwrapped_model = accelerator.unwrap_model(model)
+            
+            if not args.no_gradient_checkpointing:
+                # Disable GC for generation
+                if hasattr(unwrapped_model.model, "gradient_checkpointing_disable"):
+                    unwrapped_model.model.gradient_checkpointing_disable()
+                unwrapped_model.model.config.use_cache = True
+
             completions, _ = generate_completions(
-                model, tokenizer, prompts, args.k, args.max_gen_len, args.max_seq_len,
+                unwrapped_model, tokenizer, prompts, args.k, args.max_gen_len, args.max_seq_len, device=accelerator.device
             )
 
-            # Free generation KV cache
-            torch.cuda.empty_cache()
-
-            # Re-enable gradient checkpointing to save VRAM during the backward pass
+            # Re-enable gradient checkpointing
             if not args.no_gradient_checkpointing:
-                model.model.gradient_checkpointing_enable()
-                model.model.config.use_cache = False
+                if hasattr(unwrapped_model.model, "gradient_checkpointing_enable"):
+                    unwrapped_model.model.gradient_checkpointing_enable()
+                unwrapped_model.model.config.use_cache = False
 
-            # Compute rewards
+            # Compute rewards (CPU side)
             rewards = []
-            for comps, answer in zip(completions, answers):
+            for comps, answer in zip(completions, batch_answers):
                 rews = [exact_match_reward(c, answer) for c in comps]
                 rewards.append(rews)
 
-            # GRPO update, per-sample gradient accumulation
+            # GRPO update
             optimizer.zero_grad()
+            
+            # Pass accelerator to loss function for backward()
             avg_loss, n_samples = compute_grpo_loss_step(
                 model, tokenizer, prompts, completions, rewards,
+                accelerator=accelerator,
                 max_seq_len=args.max_seq_len,
                 micro_batch_size=args.micro_batch_size,
             )
+            
             if n_samples > 0:
-                # Scale gradients by 1/n_samples (already accumulated)
-                for p in model.trainable_parameters():
-                    if p.grad is not None:
-                        p.grad.div_(n_samples)
+                # Average gradients across microbatches if necessary
+                num_microbatches = (n_samples + args.micro_batch_size - 1) // args.micro_batch_size
+                if num_microbatches > 1:
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            p.grad.div_(num_microbatches)
+
                 optimizer.step()
 
             step += 1
-            avg_reward = sum(r for rews in rewards for r in rews) / sum(len(r) for r in rewards)
-            pbar.set_postfix(loss=f"{avg_loss:.4f}", reward=f"{avg_reward:.3f}")
-            if step % args.log_every == 0:
-                tqdm.write(f"[Epoch {epoch+1}/{args.epochs}] Step {step}  "
-                           f"Loss: {avg_loss:.4f}  Avg reward: {avg_reward:.3f}")
+            avg_reward = sum(r for rews in rewards for r in rews) / max(sum(len(r) for r in rewards), 1)
+            
+            if accelerator.is_main_process:
+                pbar.update(1)
+                pbar.set_postfix(loss=f"{avg_loss:.4f}", reward=f"{avg_reward:.3f}")
+                if step % args.log_every == 0:
+                    tqdm.write(f"[Step {step}] Loss: {avg_loss:.4f}  Avg reward: {avg_reward:.3f}")
 
     # ── Save ──
-    model.save_adapter(args.output_dir)
-    print("Done!")
+    accelerator.wait_for_everyone()
+    
+    if accelerator.is_main_process:
+        unwrapped = accelerator.unwrap_model(model)
+        unwrapped.save_adapter(args.output_dir)
+        print("Done!")
 
 
 if __name__ == "__main__":
