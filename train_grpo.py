@@ -13,7 +13,7 @@ Usage (fast iteration, 1.5B):
         --micro_batch_size 16 \
         --n_tie 560 \
         --proj_dim 13 \
-        --k 2 --compile
+        --k 2
 
 Usage (full run, 7B on 2×A100):
     accelerate launch --mixed_precision bf16 train_grpo.py \
@@ -24,7 +24,7 @@ Usage (full run, 7B on 2×A100):
         --micro_batch_size 32 \
         --n_tie 196 \
         --proj_dim 13 \
-        --k 2 --compile --no_gradient_checkpointing
+        --k 2 --no_gradient_checkpointing
 
 Usage (closer to paper (?) though some parts are a bit unclear tbh, 
             we'll see how it goes, lmk if u try it out! 
@@ -64,12 +64,15 @@ from tinylora import TinyLoRAModel
 
 def extract_answer(text: str) -> str | None:
     """Extract the final numerical answer from a model response."""
+    # Try #### pattern (GSM8K style)
     match = re.search(r"####\s*(-?[\d,]+\.?\d*)", text)
     if match:
         return match.group(1).replace(",", "").strip()
+    # Try \boxed{} pattern (MATH style)
     match = re.search(r"\\boxed\{([^}]+)\}", text)
     if match:
         return match.group(1).strip()
+    # Fallback: last number in text
     numbers = re.findall(r"-?[\d,]+\.?\d*", text)
     if numbers:
         return numbers[-1].replace(",", "").strip()
@@ -93,12 +96,17 @@ def exact_match_reward(prediction: str, ground_truth: str) -> float:
 class GSM8KDataset(Dataset):
     def __init__(self, split: str = "train", tokenizer=None):
         self.data = []
-        ds = load_dataset("openai/gsm8k", "main", split=split)
-        for row in ds:
-            self.data.append({
-                "question": row["question"],
-                "answer": row["answer"]
-            })
+        try:
+            ds = load_dataset("openai/gsm8k", "main", split=split)
+            for row in ds:
+                self.data.append({
+                    "question": row["question"],
+                    "answer": row["answer"]
+                })
+        except Exception as e:
+            print(f"Error loading dataset: {e}")
+            # Fallback for testing if dataset fails to load (e.g. no internet)
+            self.data = [{"question": "1+1", "answer": "2"}] * 10 
         self.tokenizer = tokenizer
 
     def __len__(self):
@@ -128,9 +136,13 @@ def format_prompt(question: str, tokenizer) -> str:
 def generate_completions(
     model, tokenizer, prompts: list[str], k: int, max_gen_len: int, max_seq_len: int, temperature: float = 1.0, device=None
 ) -> tuple[list[list[str]], list[list[int]]]:
-    """Batched generation."""
+    """
+    Batched generation. fast af.
+    """
+    # Set padding to LEFT for generation (for CausalLM batching)
     tokenizer.padding_side = "left"
     
+    # Tokenize all prompts at once
     inputs = tokenizer(
         prompts, 
         return_tensors="pt", 
@@ -139,6 +151,7 @@ def generate_completions(
         max_length=max_seq_len - max_gen_len,
     ).to(device)
 
+    # Generate all k completions in one go (or parallel streams)
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -150,24 +163,35 @@ def generate_completions(
             pad_token_id=tokenizer.pad_token_id,
         )
     
+    # outputs shape: [batch_size * k, total_len]
+    # We need to split them back into groups of k
+    
     all_texts = []
     all_lengths = []
+    
+    # The outputs are ordered: [p1_k1, p1_k2, ..., p2_k1, p2_k2, ...]
     prompt_lens = inputs["input_ids"].shape[1]
     
     for i in range(len(prompts)):
         start_idx = i * k
         end_idx = start_idx + k
+        
         group_texts = []
         group_lens = []
+        
         for j in range(start_idx, end_idx):
+            # Extract only the new tokens
             gen_ids = outputs[j, prompt_lens:]
             text = tokenizer.decode(gen_ids, skip_special_tokens=True)
             group_texts.append(text)
             group_lens.append(len(gen_ids))
+            
         all_texts.append(group_texts)
         all_lengths.append(group_lens)
 
+    # Reset padding side just in case
     tokenizer.padding_side = "right"
+    
     return all_texts, all_lengths
 
 
@@ -182,15 +206,13 @@ def compute_grpo_loss_step(
     micro_batch_size: int = 4,
 ) -> tuple[float, float]:
     """
-    Batched GRPO loss computation.
-    
-    Uses no_sync for ALL micro-batches to avoid DDP deadlocks when
-    ranks have different numbers of samples. Gradient sync is done
-    manually via all_reduce after this function returns.
+    Batched GRPO loss computation. 
+    Significantly faster by parallelizing the forward/backward passes.
     """
     device = accelerator.device
     total_loss = 0.0
     total_samples = 0
+    rank = accelerator.process_index
     
     all_texts = []
     all_advantages = []
@@ -199,10 +221,15 @@ def compute_grpo_loss_step(
     for prompt, comps, rews in zip(prompts, completions, rewards):
         rews_t = torch.tensor(rews, dtype=torch.float32)
         if rews_t.std() < 1e-8:
-            continue
+            continue # Skip if no signal
 
+        # Compute prompt length for masking
+        # NOTE: We re-tokenize the prompt to get the exact length
+        # This is fast enough since batch size is small
         prompt_ids = tokenizer(prompt)["input_ids"]
         p_len = len(prompt_ids)
+        
+        # Standard GRPO advantage (group norm)
         advantages = (rews_t - rews_t.mean()) / (rews_t.std() + 1e-8)
         
         for comp, adv in zip(comps, advantages):
@@ -211,58 +238,81 @@ def compute_grpo_loss_step(
             all_prompt_lens.append(p_len)
 
     if not all_texts:
-        # No trainable signal on this, 
-        # gradients stay at zero, 
-        # all_reduce after this function will still work correctly.
         return 0.0, 0
 
+    # (Since we are doing training, activations consume memory)
     model.train()
+    
     n_samples = len(all_texts)
+    # Shuffle to mix advantages (optional but good for stability)
     indices = torch.randperm(n_samples).tolist()
     
-    # Use no_sync for ALL micro-batches. We manually all_reduce the
-    # (tiny) gradients in the training loop after this function returns.
-    # This should avoid DDP deadlocks when ranks have different micro-batch counts.
-    with accelerator.no_sync(model):
-        for i in range(0, n_samples, micro_batch_size):
-            batch_indices = indices[i : i + micro_batch_size]
-            batch_texts = [all_texts[idx] for idx in batch_indices]
-            batch_adv = torch.tensor([all_advantages[idx] for idx in batch_indices], device=device)
-            batch_p_lens = torch.tensor([all_prompt_lens[idx] for idx in batch_indices], device=device)
-            
-            inputs = tokenizer(
-                batch_texts, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True, 
-                max_length=max_seq_len
-            ).to(device)
-            
+    # Use no_sync for all micro-batches except the last one.
+    # This avoids redundant DDP all-reduce on every backward() call.
+    micro_batch_starts = list(range(0, n_samples, micro_batch_size))
+    
+    for mb_idx, i in enumerate(micro_batch_starts):
+        is_last_microbatch = (mb_idx == len(micro_batch_starts) - 1)
+        # Skip gradient sync for all but the last micro-batch
+        ctx = contextlib.nullcontext() if is_last_microbatch else accelerator.no_sync(model)
+        batch_indices = indices[i : i + micro_batch_size]
+        batch_texts = [all_texts[idx] for idx in batch_indices]
+        batch_adv = torch.tensor([all_advantages[idx] for idx in batch_indices], device=device)
+        batch_p_lens = torch.tensor([all_prompt_lens[idx] for idx in batch_indices], device=device)
+        
+        # Tokenize the micro-batch
+        inputs = tokenizer(
+            batch_texts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=max_seq_len
+        ).to(device)
+        
+        # GRPO requires computing log_prob(completion | prompt)
+        # We mask out the prompt tokens from the loss
+        
+        with ctx:
             outputs = model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
             )
-            
+        
+            # Shift for autoregressive loss
             logits = outputs.logits[:, :-1, :]
             labels = inputs["input_ids"][:, 1:]
+        
+            # Compute token-level log probs
             log_probs = F.log_softmax(logits, dim=-1)
+        
+            # Gather log probs of the actual tokens
+            # shape: [B, L]
             token_log_probs = torch.gather(log_probs, -1, labels.unsqueeze(-1)).squeeze(-1)
-            
+        
+            # Mask padding in labels
             mask = inputs["attention_mask"][:, 1:]
+        
+            # Mask prompt tokens (we only want to train on the completion)
             seq_len = labels.size(1)
             range_inds = torch.arange(seq_len, device=device).unsqueeze(0)
             completion_mask = range_inds >= (batch_p_lens.unsqueeze(1) - 1)
+        
+            # Apply both padding mask and completion mask
             active_mask = mask * completion_mask
-            
+        
+            # Sum log_probs per sequence (masked)
             seq_log_probs = (token_log_probs * active_mask).sum(dim=-1)
+        
+            # GRPO Loss: -1 * (log_prob * advantage)
             loss = -(seq_log_probs * batch_adv).mean()
-            
+        
+            # Backprop with accelerator (sync only on last micro-batch)
             accelerator.backward(loss)
-            
-            total_loss += loss.item() * len(batch_indices)
-            total_samples += len(batch_indices)
-            
-            del inputs, outputs, logits, loss
+        
+        total_loss += loss.item() * len(batch_indices)
+        total_samples += len(batch_indices)
+        
+        del inputs, outputs, logits, loss
     
     return total_loss / max(total_samples, 1), total_samples
 
@@ -296,13 +346,10 @@ def main():
                         help="Micro batch size for GRPO loss computation")
     parser.add_argument("--eval_every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--compile", action="store_true",
-                        help="Use torch.compile for faster forward/backward")
     args = parser.parse_args()
     
     # Initialize Accelerator
     accelerator = Accelerator(gradient_accumulation_steps=1)
-    device = accelerator.device
     
     if args.max_seq_len <= args.max_gen_len:
         raise ValueError(f"max_seq_len ({args.max_seq_len}) must be larger than max_gen_len ({args.max_gen_len})")
@@ -325,10 +372,14 @@ def main():
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
+    # Move model to GPU immediately to ensure SVD (in TinyLoRAModel) runs on GPU.
     base_model.to(accelerator.device)
 
     if not args.no_gradient_checkpointing:
         base_model.gradient_checkpointing_enable()
+        # Gradient checkpointing requires at least one input with requires_grad=True.
+        # Since TinyLoRA freezes all base weights, we need to explicitly enable this
+        # on the input embeddings, otherwise backward() fails.
         base_model.enable_input_require_grads()
         if accelerator.is_main_process:
             print("[TinyLoRA] Gradient checkpointing enabled")
@@ -341,18 +392,15 @@ def main():
         n_tie=args.n_tie,
     )
     
+    # Enable grad for trainable params
     for p in model.trainable_parameters():
         p.requires_grad = True
 
     optimizer = AdamW(model.trainable_parameters(), lr=args.lr)
 
     # Keep a reference to the raw model for generation & saving.
-    # torch.compile + DDP are wrappers sharing the same weights.
+    # DDP wraps the model, but raw_model shares the same weights.
     raw_model = model
-    if args.compile:
-        if accelerator.is_main_process:
-            print("[TinyLoRA] Compiling model with torch.compile...")
-        model = torch.compile(model)
 
     # ── Load data ──
     if accelerator.is_main_process:
@@ -376,6 +424,7 @@ def main():
 
     # ── Training loop ──
     step = 0
+    # Calculate approximate total steps (len(dataloader) is per process)
     total_steps = len(dataloader) * args.epochs
     
     pbar = tqdm(total=total_steps, disable=not accelerator.is_main_process, desc="Training")
@@ -383,34 +432,40 @@ def main():
     for epoch in range(args.epochs):
         for batch_questions, batch_answers in dataloader:
             
+            # Form prompts
             prompts = [format_prompt(q, tokenizer) for q in batch_questions]
 
-            # ── Generation (each rank generates independently) ──
+            # Generate k completions per prompt
+            # Use raw_model (shares weights with compiled/DDP model) for generation
             if not args.no_gradient_checkpointing:
+                # Disable GC for generation
                 if hasattr(raw_model.model, "gradient_checkpointing_disable"):
                     raw_model.model.gradient_checkpointing_disable()
                 raw_model.model.config.use_cache = True
 
             completions, _ = generate_completions(
-                raw_model, tokenizer, prompts, args.k, args.max_gen_len, args.max_seq_len, device=device
+                raw_model, tokenizer, prompts, args.k, args.max_gen_len, args.max_seq_len, device=accelerator.device
             )
 
+            # Re-enable gradient checkpointing
             if not args.no_gradient_checkpointing:
                 if hasattr(raw_model.model, "gradient_checkpointing_enable"):
                     raw_model.model.gradient_checkpointing_enable()
                 raw_model.model.config.use_cache = False
 
+            # Free generation KV cache
             torch.cuda.empty_cache()
 
-            # ── Rewards ──
+            # Compute rewards (CPU side)
             rewards = []
             for comps, answer in zip(completions, batch_answers):
                 rews = [exact_match_reward(c, answer) for c in comps]
                 rewards.append(rews)
 
-            # ── GRPO update ──
+            # GRPO update
             optimizer.zero_grad()
             
+            # Pass accelerator to loss function for backward()
             avg_loss, n_samples = compute_grpo_loss_step(
                 model, tokenizer, prompts, completions, rewards,
                 accelerator=accelerator,
@@ -418,22 +473,23 @@ def main():
                 micro_batch_size=args.micro_batch_size,
             )
             
-            # Manual gradient sync across ranks.
-            # We use no_sync inside compute_grpo_loss_step to avoid DDP deadlocks,
-            # and all_reduce the tiny gradients here instead
-            if torch.distributed.is_initialized():
-                for p in raw_model.trainable_parameters():
-                    if p.grad is not None:
-                        torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
+            # Synchronize: all ranks must agree on whether to do optimizer.step()
+            # Otherwise DDP gradient sync will deadlock
+            has_samples = torch.tensor([1 if n_samples > 0 else 0], device=device)
+            torch.distributed.all_reduce(has_samples)
             
-            if n_samples > 0:
+            if has_samples.item() > 0 and n_samples > 0:
                 num_microbatches = (n_samples + args.micro_batch_size - 1) // args.micro_batch_size
                 if num_microbatches > 1:
-                    for p in raw_model.trainable_parameters():
+                    for p in model.parameters():
                         if p.grad is not None:
                             p.grad.div_(num_microbatches)
 
-            optimizer.step()
+                optimizer.step()
+            elif has_samples.item() > 0 and n_samples == 0:
+                # Other rank(s) had samples but we didn't — still need to step
+                # to keep DDP in sync (our grads are zero so it's a no-op for us)
+                optimizer.step()
 
             step += 1
             avg_reward = sum(r for rews in rewards for r in rews) / max(sum(len(r) for r in rewards), 1)
