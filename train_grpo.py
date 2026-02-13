@@ -85,7 +85,7 @@ def format_prompt(question: str, tokenizer) -> str:
 
 @torch.no_grad()
 def generate_completions(
-    model, tokenizer, prompts: list[str], k: int, max_gen_len: int, temperature: float = 1.0,
+    model, tokenizer, prompts: list[str], k: int, max_gen_len: int, max_seq_len: int, temperature: float = 1.0,
 ) -> tuple[list[list[str]], list[list[int]]]:
     """
     Batched generation. fast af.
@@ -99,7 +99,7 @@ def generate_completions(
         return_tensors="pt", 
         padding=True, 
         truncation=True, 
-        max_length=1024
+        max_length=max_seq_len - max_gen_len,
     ).to(next(model.parameters()).device)
 
     # Generate all k completions in one go (or parallel streams)
@@ -345,7 +345,7 @@ def main():
 
             # Generate k completions per prompt
             completions, _ = generate_completions(
-                model, tokenizer, prompts, args.k, args.max_gen_len,
+                model, tokenizer, prompts, args.k, args.max_gen_len, args.max_seq_len,
             )
 
             # Free generation KV cache
