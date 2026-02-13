@@ -4,7 +4,30 @@ GRPO (Group Relative Policy Optimization) training with TinyLoRA.
 A minimal implementation of GRPO for math reasoning, following the paper:
   "Learning to Reason in 13 Parameters" (2602.04118v1)
 
-Usage:
+Usage (fast iteration, 1.5B):
+    accelerate launch train_grpo.py \
+        --model Qwen/Qwen2.5-1.5B-Instruct \
+        --max_gen_len 512 \
+        --max_seq_len 1024 \
+        --batch_size 16 \
+        --micro_batch_size 16 \
+        --n_tie 560 \
+        --proj_dim 13
+
+Usage (full run, 7B on 2×A100):
+    accelerate launch --mixed_precision bf16 train_grpo.py \
+        --model Qwen/Qwen2.5-7B-Instruct \
+        --max_gen_len 512 \
+        --max_seq_len 1024 \
+        --batch_size 32 \
+        --micro_batch_size 32 \
+        --n_tie 196 \
+        --proj_dim 13 \
+        --no_gradient_checkpointing
+
+Usage (closer to paper (?) though some parts are a bit unclear tbh, 
+            we'll see how it goes, lmk if u try it out! 
+            7B on 2×A100):
     accelerate launch train_grpo.py \
         --model Qwen/Qwen2.5-7B-Instruct \
         --max_gen_len 4096 \
@@ -20,6 +43,7 @@ import argparse
 import re
 import random
 import os
+import contextlib
 
 from tqdm import tqdm
 
@@ -221,22 +245,14 @@ def compute_grpo_loss_step(
     # Shuffle to mix advantages (optional but good for stability)
     indices = torch.randperm(n_samples).tolist()
     
-    # We essentially do gradient accumulation over micro-batches here
-    # But usually accelerator handles accumulation. 
-    # Since we are doing a custom inner loop for micro-batching (to save VRAM on the forward pass of the *training* step, distinct from generation),
-    # we should manually sync only on the last step or use no_sync.
-    # However, since this whole function `compute_grpo_loss_step` is ONE logical optimizer step (or part of it),
-    # and we act on `optimizer.step()` *after* this function returns, 
-    # we just need to make sure gradients accumulate in `p.grad`.
-    # `accelerator.backward(loss)` will do that.
+    # Use no_sync for all micro-batches except the last one.
+    # This avoids redundant DDP all-reduce on every backward() call.
+    micro_batch_starts = list(range(0, n_samples, micro_batch_size))
     
-    # NOTE: DDP will synchronize gradients on every backward(). 
-    # If we do multiple backwards per step, we might be syncing too often.
-    # We should use `accelerator.no_sync(model)` for all but the last micro-batch if we want efficiency,
-    # OR since we are just doing a few micro-batches, maybe it's fine.
-    # But let's keep it simple for now. 
-    
-    for i in range(0, n_samples, micro_batch_size):
+    for mb_idx, i in enumerate(micro_batch_starts):
+        is_last_microbatch = (mb_idx == len(micro_batch_starts) - 1)
+        # Skip gradient sync for all but the last micro-batch
+        ctx = contextlib.nullcontext() if is_last_microbatch else accelerator.no_sync(model)
         batch_indices = indices[i : i + micro_batch_size]
         batch_texts = [all_texts[idx] for idx in batch_indices]
         batch_adv = torch.tensor([all_advantages[idx] for idx in batch_indices], device=device)
@@ -254,42 +270,42 @@ def compute_grpo_loss_step(
         # GRPO requires computing log_prob(completion | prompt)
         # We mask out the prompt tokens from the loss
         
-        outputs = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-        )
+        with ctx:
+            outputs = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+            )
         
-        # Shift for autoregressive loss
-        logits = outputs.logits[:, :-1, :]
-        labels = inputs["input_ids"][:, 1:]
+            # Shift for autoregressive loss
+            logits = outputs.logits[:, :-1, :]
+            labels = inputs["input_ids"][:, 1:]
         
-        # Compute token-level log probs
-        log_probs = F.log_softmax(logits, dim=-1)
+            # Compute token-level log probs
+            log_probs = F.log_softmax(logits, dim=-1)
         
-        # Gather log probs of the actual tokens
-        # shape: [B, L]
-        token_log_probs = torch.gather(log_probs, -1, labels.unsqueeze(-1)).squeeze(-1)
+            # Gather log probs of the actual tokens
+            # shape: [B, L]
+            token_log_probs = torch.gather(log_probs, -1, labels.unsqueeze(-1)).squeeze(-1)
         
-        # Mask padding in labels (usually pad_token_id is handled, but explicit mask is safer)
-        mask = inputs["attention_mask"][:, 1:]
+            # Mask padding in labels
+            mask = inputs["attention_mask"][:, 1:]
         
-        # Mask prompt tokens (we only want to train on the completion)
-        seq_len = labels.size(1)
-        range_inds = torch.arange(seq_len, device=device).unsqueeze(0)
-        # Mask indices < p_len - 1 (shifted by 1)
-        completion_mask = range_inds >= (batch_p_lens.unsqueeze(1) - 1)
+            # Mask prompt tokens (we only want to train on the completion)
+            seq_len = labels.size(1)
+            range_inds = torch.arange(seq_len, device=device).unsqueeze(0)
+            completion_mask = range_inds >= (batch_p_lens.unsqueeze(1) - 1)
         
-        # Apply both padding mask and completion mask
-        active_mask = mask * completion_mask
+            # Apply both padding mask and completion mask
+            active_mask = mask * completion_mask
         
-        # Sum log_probs per sequence (masked)
-        seq_log_probs = (token_log_probs * active_mask).sum(dim=-1)
+            # Sum log_probs per sequence (masked)
+            seq_log_probs = (token_log_probs * active_mask).sum(dim=-1)
         
-        # GRPO Loss: -1 * (log_prob * advantage)
-        loss = -(seq_log_probs * batch_adv).mean()
-    
-        # Backprop with accelerator
-        accelerator.backward(loss)
+            # GRPO Loss: -1 * (log_prob * advantage)
+            loss = -(seq_log_probs * batch_adv).mean()
+        
+            # Backprop with accelerator (sync only on last micro-batch)
+            accelerator.backward(loss)
         
         total_loss += loss.item() * len(batch_indices)
         total_samples += len(batch_indices)
