@@ -5,19 +5,15 @@ A minimal implementation of GRPO for math reasoning, following the paper:
   "Learning to Reason in 13 Parameters" (2602.04118v1)
 
 Usage:
-    python train_grpo.py \
+    train_grpo.py \
         --model Qwen/Qwen2.5-7B-Instruct \
-        --dataset gsm8k \
-        --rank 2 --proj_dim 1 --n_tie 560 \
-        --lr 1e-4 --epochs 3 --k 4 --batch_size 4 \
-        --max_gen_len 128 --max_seq_len 1024
-
-    # Or for the paper's max generation length (4096):
-    python train_grpo.py \
-        --model Qwen/Qwen2.5-1.5B-Instruct \
         --max_gen_len 4096 \
         --max_seq_len 5120 \
-        --batch_size 1 --no_gradient_checkpointing
+        --batch_size 64 \
+        --micro_batch_size 64 \
+        --n_tie 196 \
+        --proj_dim 13 \
+        --no_gradient_checkpointing
 """
 
 import argparse
