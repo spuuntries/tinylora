@@ -400,6 +400,9 @@ def main():
     optimizer = AdamW(model.trainable_parameters(), lr=args.lr)
 
     # ── Compile for speed ──
+    # Keep a reference to the raw model for generation (torch.compile + DDP
+    # wrapping makes unwrapping fragile, but the raw model shares the same weights)
+    raw_model = model
     if args.compile:
         if accelerator.is_main_process:
             print("[TinyLoRA] Compiling model with torch.compile...")
@@ -439,24 +442,22 @@ def main():
             prompts = [format_prompt(q, tokenizer) for q in batch_questions]
 
             # Generate k completions per prompt
-            # We need to unwrap the model to call generate safely if it's DDP wrapped
-            unwrapped_model = accelerator.unwrap_model(model)
-            
+            # Use raw_model (shares weights with compiled/DDP model) for generation
             if not args.no_gradient_checkpointing:
                 # Disable GC for generation
-                if hasattr(unwrapped_model.model, "gradient_checkpointing_disable"):
-                    unwrapped_model.model.gradient_checkpointing_disable()
-                unwrapped_model.model.config.use_cache = True
+                if hasattr(raw_model.model, "gradient_checkpointing_disable"):
+                    raw_model.model.gradient_checkpointing_disable()
+                raw_model.model.config.use_cache = True
 
             completions, _ = generate_completions(
-                unwrapped_model, tokenizer, prompts, args.k, args.max_gen_len, args.max_seq_len, device=accelerator.device
+                raw_model, tokenizer, prompts, args.k, args.max_gen_len, args.max_seq_len, device=accelerator.device
             )
 
             # Re-enable gradient checkpointing
             if not args.no_gradient_checkpointing:
-                if hasattr(unwrapped_model.model, "gradient_checkpointing_enable"):
-                    unwrapped_model.model.gradient_checkpointing_enable()
-                unwrapped_model.model.config.use_cache = False
+                if hasattr(raw_model.model, "gradient_checkpointing_enable"):
+                    raw_model.model.gradient_checkpointing_enable()
+                raw_model.model.config.use_cache = False
 
             # Compute rewards (CPU side)
             rewards = []
@@ -498,8 +499,7 @@ def main():
     accelerator.wait_for_everyone()
     
     if accelerator.is_main_process:
-        unwrapped = accelerator.unwrap_model(model)
-        unwrapped.save_adapter(args.output_dir)
+        raw_model.save_adapter(args.output_dir)
         print("Done!")
 
 
