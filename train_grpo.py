@@ -10,7 +10,14 @@ Usage:
         --dataset gsm8k \
         --rank 2 --proj_dim 1 --n_tie 560 \
         --lr 1e-4 --epochs 3 --k 4 --batch_size 4 \
-        --max_gen_len 4096
+        --max_gen_len 128 --max_seq_len 1024
+
+    # Or for the paper's max generation length (4096):
+    python train_grpo.py \
+        --model Qwen/Qwen2.5-1.5B-Instruct \
+        --max_gen_len 4096 \
+        --max_seq_len 5120 \
+        --batch_size 1 --no_gradient_checkpointing
 """
 
 import argparse
@@ -296,6 +303,9 @@ def main():
     parser.add_argument("--eval_every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    
+    if args.max_seq_len <= args.max_gen_len:
+        raise ValueError(f"max_seq_len ({args.max_seq_len}) must be larger than max_gen_len ({args.max_gen_len})")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
