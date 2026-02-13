@@ -473,22 +473,21 @@ def main():
                 micro_batch_size=args.micro_batch_size,
             )
             
-            # Synchronize: all ranks must agree on whether to do optimizer.step()
-            # Otherwise DDP gradient sync will deadlock
-            has_samples = torch.tensor([1 if n_samples > 0 else 0], device=device)
-            torch.distributed.all_reduce(has_samples)
+            # Manual gradient sync across ranks.
+            # We use no_sync inside compute_grpo_loss_step to avoid DDP deadlocks,
+            # and all_reduce the tiny gradients here instead.
+            if torch.distributed.is_initialized():
+                for p in raw_model.trainable_parameters():
+                    if p.grad is not None:
+                        torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
             
-            if has_samples.item() > 0 and n_samples > 0:
+            if n_samples > 0:
                 num_microbatches = (n_samples + args.micro_batch_size - 1) // args.micro_batch_size
                 if num_microbatches > 1:
-                    for p in model.parameters():
+                    for p in raw_model.trainable_parameters():
                         if p.grad is not None:
                             p.grad.div_(num_microbatches)
 
-                optimizer.step()
-            elif has_samples.item() > 0 and n_samples == 0:
-                # Other rank(s) had samples but we didn't — still need to step
-                # to keep DDP in sync (our grads are zero so it's a no-op for us)
                 optimizer.step()
 
             step += 1
