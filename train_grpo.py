@@ -251,11 +251,19 @@ def init_vllm_engine(
     """
     Initialize a vLLM LLM engine for inference.
 
-    CRITICAL: We must scrub DDP-related env vars before init. vLLM V1 spawns
-    a subprocess (EngineCore) that inherits the process environment. If
-    accelerate's MASTER_ADDR/WORLD_SIZE/etc. leak through, EngineCore's NCCL
-    init will try to join a distributed group that doesn't exist → deadlock.
+    CRITICAL: Two things prevent deadlocks when running alongside DDP:
+
+    1. Force V0 engine (VLLM_USE_V1=0): V1 spawns a subprocess (EngineCore)
+       that does its own NCCL init, which deadlocks on kernel <5.5.0 when
+       the GPU already has an active CUDA context. V0 runs in-process.
+
+    2. Scrub DDP env vars: Even with V0, leftover MASTER_ADDR/WORLD_SIZE
+       etc. can confuse vLLM's distributed init.
     """
+    # Force V0 engine — runs in-process, no subprocess spawn
+    os.environ["VLLM_USE_V1"] = "0"
+    print("[vLLM] Forced V0 engine (VLLM_USE_V1=0) to avoid subprocess NCCL deadlock")
+
     from vllm import LLM
 
     # Save and scrub DDP env vars so vLLM's subprocess starts clean
@@ -302,14 +310,21 @@ def update_vllm_weights(llm, merged_state_dict: dict[str, torch.Tensor]):
     for k, v in merged_state_dict.items():
         new_key = k.replace(".W_frozen", ".weight")
         # Skip TinyLoRA-specific buffers that vLLM doesn't need
-        skip_suffixes = (".U", ".S", ".V", ".P")
+        skip_suffixes = (".U", ".S", ".V", ".P", ".bias")
         if any(new_key.endswith(s) for s in skip_suffixes):
-            continue
+            # Only skip .bias if it's a TinyLoRA layer buffer, not a real bias
+            if not new_key.endswith(".bias"):
+                continue
         translated[new_key] = v
 
-    # vLLM's weight loading interface
-    runner = llm.llm_engine.model_executor.driver_worker.model_runner
-    runner.model.load_weights(translated.items())
+    # vLLM V0 weight loading interface
+    try:
+        runner = llm.llm_engine.model_executor.driver_worker.model_runner
+        runner.model.load_weights(translated.items())
+    except AttributeError:
+        # Fallback: try iterating workers
+        for worker in llm.llm_engine.model_executor.workers:
+            worker.model_runner.model.load_weights(translated.items())
 
 
 @torch.no_grad()

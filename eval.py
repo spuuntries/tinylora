@@ -365,6 +365,10 @@ def main():
         else:
             model_path = args.model
 
+        import os
+
+        os.environ["VLLM_USE_V1"] = "0"
+        print("[vLLM] Forced V0 engine (VLLM_USE_V1=0)")
         from vllm import LLM
 
         llm = LLM(
