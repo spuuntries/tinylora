@@ -223,6 +223,25 @@ def generate_completions_hf(
 # ─── vLLM generation ────────────────────────────────────────────────────────
 
 
+# DDP env vars that leak into vLLM's spawned subprocess and cause NCCL deadlocks.
+# We scrub them before vLLM init and restore after.
+_DDP_ENV_VARS = [
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
+    "GROUP_RANK",
+    "ROLE_RANK",
+    "ROLE_WORLD_SIZE",
+    "TORCHELASTIC_RESTART_COUNT",
+    "TORCHELASTIC_MAX_RESTARTS",
+    "TORCHELASTIC_RUN_ID",
+    "NCCL_ASYNC_ERROR_HANDLING",
+]
+
+
 def init_vllm_engine(
     model_name: str,
     gpu_memory_utilization: float = 0.4,
@@ -232,23 +251,41 @@ def init_vllm_engine(
     """
     Initialize a vLLM LLM engine for inference.
 
-    The engine runs as a separate process-internal model, avoiding conflicts
-    with PyTorch DDP by only being instantiated on rank 0.
+    CRITICAL: We must scrub DDP-related env vars before init. vLLM V1 spawns
+    a subprocess (EngineCore) that inherits the process environment. If
+    accelerate's MASTER_ADDR/WORLD_SIZE/etc. leak through, EngineCore's NCCL
+    init will try to join a distributed group that doesn't exist → deadlock.
     """
     from vllm import LLM
 
-    llm = LLM(
-        model=model_name,
-        gpu_memory_utilization=gpu_memory_utilization,
-        max_model_len=max_model_len,
-        enforce_eager=enforce_eager,
-        dtype="bfloat16",
-        # Don't let vLLM try to use multi-GPU tensor parallel —
-        # we handle multi-GPU via DDP on the training side
-        tensor_parallel_size=1,
-        # Disable usage stats to avoid network calls
-        disable_custom_all_reduce=True,
-    )
+    # Save and scrub DDP env vars so vLLM's subprocess starts clean
+    saved_env = {}
+    for var in _DDP_ENV_VARS:
+        if var in os.environ:
+            saved_env[var] = os.environ.pop(var)
+            print(f"[vLLM] Scrubbed env var {var}={saved_env[var]}")
+
+    print("[vLLM] Creating LLM engine...")
+    try:
+        llm = LLM(
+            model=model_name,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            enforce_eager=enforce_eager,
+            dtype="bfloat16",
+            # Don't let vLLM try to use multi-GPU tensor parallel —
+            # we handle multi-GPU via DDP on the training side
+            tensor_parallel_size=1,
+            # Disable usage stats to avoid network calls
+            disable_custom_all_reduce=True,
+        )
+        print("[vLLM] LLM engine created successfully")
+    finally:
+        # Restore DDP env vars so the rest of training still works
+        for var, val in saved_env.items():
+            os.environ[var] = val
+            print(f"[vLLM] Restored env var {var}={val}")
+
     return llm
 
 
@@ -675,10 +712,19 @@ def main():
     # ── Initialize vLLM engine (rank 0 only) ──
     vllm_engine = None
     if args.use_vllm:
+        if accelerator.num_processes > 1:
+            print(
+                "[vLLM] WARNING: Running with multiple DDP processes. "
+                "TinyLoRA has very few trainable params, so DDP provides "
+                "no benefit. Consider running with a single process: "
+                "python train_grpo.py --use_vllm ... (no accelerate launch)"
+            )
         if accelerator.is_main_process:
             print("[vLLM] Initializing vLLM engine for inference...")
             print(f"[vLLM] GPU memory utilization: {args.vllm_gpu_ratio}")
             print(f"[vLLM] Importance sampling clip ratio: {args.is_clip}")
+            print(f"[vLLM] DDP world size: {accelerator.num_processes}")
+            print(f"[vLLM] CUDA device: {accelerator.device}")
             vllm_engine = init_vllm_engine(
                 model_name=args.model,
                 gpu_memory_utilization=args.vllm_gpu_ratio,
@@ -686,6 +732,9 @@ def main():
                 enforce_eager=True,
             )
             print("[vLLM] Engine initialized successfully")
+        # Sync all ranks — rank 1+ wait for rank 0 to finish vLLM init
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     # ── Load data ──
     if accelerator.is_main_process:
@@ -730,19 +779,29 @@ def main():
 
                 # 1. Get merged state dict (non-destructive)
                 if accelerator.is_main_process:
+                    if step % args.log_every == 0:
+                        print(f"[vLLM][Step {step}] Computing merged state dict...")
                     merged_sd = raw_model.get_merged_state_dict()
 
                     # 2. Update vLLM engine weights
+                    if step % args.log_every == 0:
+                        print(f"[vLLM][Step {step}] Updating vLLM weights...")
                     update_vllm_weights(vllm_engine, merged_sd)
                     del merged_sd
 
                     # 3. Generate with vLLM
+                    if step % args.log_every == 0:
+                        print(
+                            f"[vLLM][Step {step}] Generating {len(prompts)}×{args.k} completions..."
+                        )
                     completions, gen_lengths = generate_completions_vllm(
                         vllm_engine,
                         prompts,
                         args.k,
                         args.max_gen_len,
                     )
+                    if step % args.log_every == 0:
+                        print(f"[vLLM][Step {step}] Generation complete")
 
                 # 4. Broadcast completions from rank 0 to all ranks
                 if torch.distributed.is_initialized():
