@@ -303,8 +303,9 @@ def init_vllm_engine(
 # in a separate EngineCore subprocess with no reliable public API for
 # in-memory weight updates. Instead, we initialize vLLM once with the
 # base model weights and rely on truncated importance sampling to correct
-# for the policy mismatch. With only 13 trainable params, TinyLoRA's
-# delta is tiny, so the IS correction is lightweight.
+# for the policy mismatch. TinyLoRA's SVD structure constrains each
+# adapted layer to a small rank-1 perturbation, keeping the delta between
+# the base model and the LoRA model small regardless of config.
 
 
 @torch.no_grad()

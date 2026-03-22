@@ -21,6 +21,30 @@ accelerate launch --mixed_precision bf16 train_grpo.py \
     --k 2
 ```
 
+### With vLLM (faster inference)
+
+Install vLLM (`pip install vllm`) and run with `--use_vllm`. Use `--num_processes=1` to avoid DDP conflicts:
+
+```bash
+# Single GPU
+accelerate launch --num_processes=1 --mixed_precision bf16 train_grpo.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --max_gen_len 512 --max_seq_len 1024 \
+    --batch_size 32 --micro_batch_size 32 \
+    --n_tie 196 --proj_dim 13 --k 2 \
+    --no_gradient_checkpointing \
+    --use_vllm --vllm_gpu_ratio 0.4
+
+# Multi-GPU (tensor parallel, all GPUs used for generation)
+accelerate launch --num_processes=1 --mixed_precision bf16 train_grpo.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --max_gen_len 512 --max_seq_len 1024 \
+    --batch_size 32 --micro_batch_size 32 \
+    --n_tie 196 --proj_dim 13 --k 2 \
+    --no_gradient_checkpointing \
+    --use_vllm --vllm_tp_size 2 --vllm_gpu_ratio 0.9
+```
+
 This will get us 13 parameters from the `u`=13 and the `n_tie`=196 (where the number of modules is 28 layers × 7 modules per layer = 196 modules). You can try messing around with the parameters. _I am_, at least. Do let me know if you find anything interesting! :d
 
 Here's one epoch
@@ -29,7 +53,5 @@ Here's one epoch
 I _do_ think that you'd need a longer seqlen than that, though I'm still waiting on some compute to land on my end before I do much more, lol.
 
 I'm also not entirely sure if the reward function is correct, but it's a start. It should be (I think? I didn't do KL on the GRPO, but that's what they said in the paper).
-
-Another to-do is to use an inference engine or optimize the inference pipeline, since it's currently pretty slow on that front.
 
 H- hmu if u can gime some compute or help w/ the implementation, k? 🥺👉👈
