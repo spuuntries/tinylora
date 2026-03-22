@@ -35,14 +35,23 @@ accelerate launch --num_processes=1 --mixed_precision bf16 train_grpo.py \
     --no_gradient_checkpointing \
     --use_vllm --vllm_gpu_ratio 0.4
 
-# Multi-GPU (tensor parallel, all GPUs used for generation)
+# 2 GPUs, dedicated split (training on GPU 0, vLLM on GPU 1)
 accelerate launch --num_processes=1 --mixed_precision bf16 train_grpo.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --max_gen_len 512 --max_seq_len 1024 \
     --batch_size 32 --micro_batch_size 32 \
     --n_tie 196 --proj_dim 13 --k 2 \
     --no_gradient_checkpointing \
-    --use_vllm --vllm_tp_size 2 --vllm_gpu_ratio 0.9
+    --use_vllm --vllm_gpu_id 1 --vllm_gpu_ratio 0.9
+
+# 2 GPUs, tensor parallel (both GPUs used for generation)
+accelerate launch --num_processes=1 --mixed_precision bf16 train_grpo.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --max_gen_len 512 --max_seq_len 1024 \
+    --batch_size 32 --micro_batch_size 32 \
+    --n_tie 196 --proj_dim 13 --k 2 \
+    --no_gradient_checkpointing \
+    --use_vllm --vllm_tp_size 2 --vllm_gpu_ratio 0.4
 ```
 
 This will get us 13 parameters from the `u`=13 and the `n_tie`=196 (where the number of modules is 28 layers × 7 modules per layer = 196 modules). You can try messing around with the parameters. _I am_, at least. Do let me know if you find anything interesting! :d
