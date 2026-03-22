@@ -3,8 +3,8 @@ TinyLoRA: Learning to Reason in 13 Parameters
 Paper: https://arxiv.org/abs/2602.04118v1
 
 Core implementation of TinyLoRA:
-Essentially an ultra-low-rank adapter that scales LoRA 
-down to as few as 1 trainable parameter by projecting a shared trainable vector 
+Essentially an ultra-low-rank adapter that scales LoRA
+down to as few as 1 trainable parameter by projecting a shared trainable vector
 through fixed random matrices onto truncated SVD directions of frozen weights.
 """
 
@@ -55,14 +55,14 @@ class TinyLoRALayer(nn.Module):
 
         # ── Truncated SVD ──
         U_full, S_full, Vh_full = torch.linalg.svd(W, full_matrices=False)
-        U_r = U_full[:, :rank]          # (d_out, r)
+        U_r = U_full[:, :rank]  # (d_out, r)
         S_r = torch.diag(S_full[:rank])  # (r, r)
-        V_r = Vh_full[:rank, :].T        # (d_in, r)
+        V_r = Vh_full[:rank, :].T  # (d_in, r)
 
         # Cast back to original dtype for all buffers
-        self.register_buffer("U", U_r.to(orig_dtype))          # (d_out, r)
-        self.register_buffer("S", S_r.to(orig_dtype))          # (r, r)
-        self.register_buffer("V", V_r.to(orig_dtype))          # (d_in, r)
+        self.register_buffer("U", U_r.to(orig_dtype))  # (d_out, r)
+        self.register_buffer("S", S_r.to(orig_dtype))  # (r, r)
+        self.register_buffer("V", V_r.to(orig_dtype))  # (d_in, r)
 
         # ── Frozen original weight (for forward pass) ──
         self.register_buffer("W_frozen", original_linear.weight.data.clone())
@@ -100,11 +100,11 @@ class TinyLoRALayer(nn.Module):
         # TinyLoRA delta:  x @ V @ Rᵀ @ Σ @ Uᵀ  (transposed because F.linear uses Wᵀ)
         R = self._compute_R()  # (r, r)
         # x: (..., d_in)
-        h = x @ self.V               # (..., r)
+        h = x @ self.V  # (..., r)
         # Ensure R is on the same device as h
-        h = h @ R.to(h.device).T      # (..., r)
-        h = h @ self.S               # (..., r)
-        h = h @ self.U.T             # (..., d_out)
+        h = h @ R.to(h.device).T  # (..., r)
+        h = h @ self.S  # (..., r)
+        h = h @ self.U.T  # (..., d_out)
 
         return base + h
 
@@ -113,8 +113,13 @@ class TinyLoRALayer(nn.Module):
 
 # Covers LLaMA, Qwen, Mistral and similar architectures
 DEFAULT_TARGET_MODULES = [
-    "q_proj", "k_proj", "v_proj", "o_proj",   # Attention
-    "gate_proj", "up_proj", "down_proj",        # MLP
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",  # Attention
+    "gate_proj",
+    "up_proj",
+    "down_proj",  # MLP
 ]
 
 
@@ -157,9 +162,9 @@ class TinyLoRAModel(nn.Module):
 
         # Create shared v parameters
         n_groups = max(1, len(targets) // n_tie)
-        self.shared_vs = nn.ParameterList([
-            nn.Parameter(torch.zeros(proj_dim)) for _ in range(n_groups)
-        ])
+        self.shared_vs = nn.ParameterList(
+            [nn.Parameter(torch.zeros(proj_dim)) for _ in range(n_groups)]
+        )
 
         # Replace each target linear with a TinyLoRALayer
         for idx, (name, module) in enumerate(targets):
@@ -177,10 +182,12 @@ class TinyLoRAModel(nn.Module):
 
         # Report
         total_params = sum(p.numel() for p in self.trainable_parameters())
-        print(f"[TinyLoRA] Adapted {len(self._adapted_names)} modules, "
-              f"{len(self.shared_vs)} shared v groups, "
-              f"{total_params} trainable parameters "
-              f"({total_params * 2} bytes in bf16)")
+        print(
+            f"[TinyLoRA] Adapted {len(self._adapted_names)} modules, "
+            f"{len(self.shared_vs)} shared v groups, "
+            f"{total_params} trainable parameters "
+            f"({total_params * 2} bytes in bf16)"
+        )
 
     def _find_target_modules(self) -> list[tuple[str, nn.Linear]]:
         """Find all nn.Linear modules matching target names."""
@@ -223,14 +230,14 @@ class TinyLoRAModel(nn.Module):
             for part in parts[:-1]:
                 parent = getattr(parent, part)
             layer: TinyLoRALayer = getattr(parent, parts[-1])
-            
+
             # Ensure everything is on the same device as the target weight
             target_device = layer.W_frozen.device
             R = layer._compute_R().to(target_device)
             U = layer.U.to(target_device)
             S = layer.S.to(target_device)
             V = layer.V.to(target_device)
-            
+
             delta = U @ S @ R @ V.T  # (d_out, d_in)
             layer.W_frozen.add_(delta)
 
@@ -242,15 +249,47 @@ class TinyLoRAModel(nn.Module):
             for part in parts[:-1]:
                 parent = getattr(parent, part)
             layer: TinyLoRALayer = getattr(parent, parts[-1])
-            
+
             target_device = layer.W_frozen.device
             R = layer._compute_R().to(target_device)
             U = layer.U.to(target_device)
             S = layer.S.to(target_device)
             V = layer.V.to(target_device)
-            
+
             delta = U @ S @ R @ V.T
             layer.W_frozen.sub_(delta)
+
+    def get_merged_state_dict(self) -> dict[str, torch.Tensor]:
+        """
+        Return a state dict with TinyLoRA deltas merged into frozen weights.
+
+        Unlike merge(), this does NOT modify the model in-place. It returns a
+        new dict suitable for loading into a separate model (e.g. vLLM).
+        """
+        # Start from the base model's state dict (shallow copy of tensors)
+        sd = {k: v.clone() for k, v in self.model.state_dict().items()}
+
+        for name in self._adapted_names:
+            parts = name.split(".")
+            parent = self.model
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            layer: TinyLoRALayer = getattr(parent, parts[-1])
+
+            R = layer._compute_R()
+            delta = layer.U @ layer.S @ R @ layer.V.T  # (d_out, d_in)
+
+            # The key in the state dict for the frozen weight
+            weight_key = name + ".W_frozen"
+            if weight_key in sd:
+                sd[weight_key] = sd[weight_key] + delta.to(sd[weight_key].dtype)
+            else:
+                # Fallback: try the standard .weight key
+                weight_key = name + ".weight"
+                if weight_key in sd:
+                    sd[weight_key] = sd[weight_key] + delta.to(sd[weight_key].dtype)
+
+        return sd
 
     # ── Save / load adapter ─────────────────────────────────────────────────
 
@@ -274,9 +313,11 @@ class TinyLoRAModel(nn.Module):
         }
         with open(p / "config.json", "w") as f:
             json.dump(config, f, indent=2)
-        print(f"[TinyLoRA] Saved adapter to {p}  "
-              f"({self.num_trainable_parameters()} params, "
-              f"{self.num_trainable_parameters() * 2} bytes)")
+        print(
+            f"[TinyLoRA] Saved adapter to {p}  "
+            f"({self.num_trainable_parameters()} params, "
+            f"{self.num_trainable_parameters() * 2} bytes)"
+        )
 
     def load_adapter(self, path: str):
         """Load trained v vectors from disk."""
