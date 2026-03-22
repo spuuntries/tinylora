@@ -306,8 +306,9 @@ def update_vllm_weights(llm, merged_state_dict: dict[str, torch.Tensor]):
             continue
         translated[new_key] = v
 
-    # Convert to list of tuples for serialization over IPC
-    weight_pairs = list(translated.items())
+    # Move tensors to CPU for IPC serialization (collective_rpc uses pickle,
+    # which can't handle CUDA tensors directly)
+    weight_pairs = [(k, v.cpu()) for k, v in translated.items()]
 
     # Try vLLM V1 API first (0.17+): collective_rpc sends to EngineCore subprocess
     if hasattr(llm, "collective_rpc"):
