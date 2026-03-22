@@ -251,19 +251,10 @@ def init_vllm_engine(
     """
     Initialize a vLLM LLM engine for inference.
 
-    CRITICAL: Two things prevent deadlocks when running alongside DDP:
-
-    1. Force V0 engine (VLLM_USE_V1=0): V1 spawns a subprocess (EngineCore)
-       that does its own NCCL init, which deadlocks on kernel <5.5.0 when
-       the GPU already has an active CUDA context. V0 runs in-process.
-
-    2. Scrub DDP env vars: Even with V0, leftover MASTER_ADDR/WORLD_SIZE
-       etc. can confuse vLLM's distributed init.
+    When running alongside DDP (accelerate launch), we scrub DDP env vars
+    before init to prevent vLLM's EngineCore subprocess from inheriting
+    MASTER_ADDR/WORLD_SIZE/etc. and trying to join a non-existent NCCL group.
     """
-    # Force V0 engine — runs in-process, no subprocess spawn
-    os.environ["VLLM_USE_V1"] = "0"
-    print("[vLLM] Forced V0 engine (VLLM_USE_V1=0) to avoid subprocess NCCL deadlock")
-
     from vllm import LLM
 
     # Save and scrub DDP env vars so vLLM's subprocess starts clean
@@ -301,30 +292,53 @@ def update_vllm_weights(llm, merged_state_dict: dict[str, torch.Tensor]):
     """
     Hot-swap vLLM's model weights with merged TinyLoRA weights.
 
-    This avoids re-initializing the entire engine on every step.
-    We translate from the TinyLoRA state dict keys (which use .W_frozen)
-    back to the original HF weight keys that vLLM expects.
+    In vLLM V1 (0.17+), the model runs in a separate EngineCore subprocess,
+    so we use collective_rpc("load_weights") to send the weights over IPC.
+    Falls back to the V0 API (model_executor.driver_worker) for older versions.
     """
     # Translate .W_frozen keys back to .weight for vLLM
     translated = {}
     for k, v in merged_state_dict.items():
         new_key = k.replace(".W_frozen", ".weight")
-        # Skip TinyLoRA-specific buffers that vLLM doesn't need
-        skip_suffixes = (".U", ".S", ".V", ".P", ".bias")
+        # Skip TinyLoRA-specific buffers (U, S, V, P) that vLLM doesn't need
+        skip_suffixes = (".U", ".S", ".V", ".P")
         if any(new_key.endswith(s) for s in skip_suffixes):
-            # Only skip .bias if it's a TinyLoRA layer buffer, not a real bias
-            if not new_key.endswith(".bias"):
-                continue
+            continue
         translated[new_key] = v
 
-    # vLLM V0 weight loading interface
+    # Convert to list of tuples for serialization over IPC
+    weight_pairs = list(translated.items())
+
+    # Try vLLM V1 API first (0.17+): collective_rpc sends to EngineCore subprocess
+    if hasattr(llm, "collective_rpc"):
+        try:
+            llm.collective_rpc("load_weights", args=(weight_pairs,))
+            return
+        except Exception as e:
+            print(f"[vLLM] collective_rpc('load_weights') failed: {e}")
+            print("[vLLM] Trying alternative weight update methods...")
+
+    # Try V0 API (direct model access, vLLM <0.17)
     try:
         runner = llm.llm_engine.model_executor.driver_worker.model_runner
-        runner.model.load_weights(translated.items())
+        runner.model.load_weights(weight_pairs)
+        return
     except AttributeError:
-        # Fallback: try iterating workers
+        pass
+
+    # Last resort: try iterating workers
+    try:
         for worker in llm.llm_engine.model_executor.workers:
-            worker.model_runner.model.load_weights(translated.items())
+            worker.model_runner.model.load_weights(weight_pairs)
+        return
+    except AttributeError:
+        pass
+
+    raise RuntimeError(
+        "[vLLM] Could not update model weights. "
+        f"vLLM version may be unsupported. "
+        f"LLM type: {type(llm)}, engine type: {type(llm.llm_engine)}"
+    )
 
 
 @torch.no_grad()
