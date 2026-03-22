@@ -26,8 +26,8 @@ Usage (full run, 7B on 2×A100):
         --proj_dim 13 \
         --k 2 --no_gradient_checkpointing
 
-Usage (with vLLM for inference, 7B on 2×A100):
-    accelerate launch --mixed_precision bf16 train_grpo.py \
+Usage (with vLLM, single GPU):
+    accelerate launch --num_processes=1 --mixed_precision bf16 train_grpo.py \
         --model Qwen/Qwen2.5-7B-Instruct \
         --max_gen_len 512 \
         --max_seq_len 1024 \
@@ -38,10 +38,22 @@ Usage (with vLLM for inference, 7B on 2×A100):
         --k 2 --no_gradient_checkpointing \
         --use_vllm --vllm_gpu_ratio 0.4
 
-Usage (closer to paper (?) though some parts are a bit unclear tbh, 
-            we'll see how it goes, lmk if u try it out! 
-            7B on 2×A100):
-    accelerate launch train_grpo.py \
+Usage (with vLLM, multi-GPU tensor parallel, all GPUs used for generation):
+    accelerate launch --num_processes=1 --mixed_precision bf16 train_grpo.py \
+        --model Qwen/Qwen2.5-7B-Instruct \
+        --max_gen_len 512 \
+        --max_seq_len 1024 \
+        --batch_size 32 \
+        --micro_batch_size 32 \
+        --n_tie 196 \
+        --proj_dim 13 \
+        --k 2 --no_gradient_checkpointing \
+        --use_vllm --vllm_tp_size 2 --vllm_gpu_ratio 0.9
+
+Usage (closer to paper (?) though some parts are a bit unclear tbh,
+            we'll see how it goes, lmk if u try it out!
+            7B on 2xA100, use --use_vllm for the long seqlen):
+    accelerate launch --num_processes=1 --mixed_precision bf16 train_grpo.py \
         --model Qwen/Qwen2.5-7B-Instruct \
         --max_gen_len 4096 \
         --max_seq_len 5120 \
@@ -49,7 +61,8 @@ Usage (closer to paper (?) though some parts are a bit unclear tbh,
         --micro_batch_size 64 \
         --n_tie 196 \
         --proj_dim 13 \
-        --no_gradient_checkpointing
+        --no_gradient_checkpointing \
+        --use_vllm --vllm_tp_size 2 --vllm_gpu_ratio 0.9
 """
 
 import argparse
