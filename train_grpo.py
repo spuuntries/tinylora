@@ -247,24 +247,35 @@ def init_vllm_engine(
     gpu_memory_utilization: float = 0.4,
     max_model_len: int = 4096,
     enforce_eager: bool = True,
+    tp_size: int = 1,
+    gpu_id: int | None = None,
 ):
     """
     Initialize a vLLM LLM engine for inference.
 
-    When running alongside DDP (accelerate launch), we scrub DDP env vars
-    before init to prevent vLLM's EngineCore subprocess from inheriting
-    MASTER_ADDR/WORLD_SIZE/etc. and trying to join a non-existent NCCL group.
+    Args:
+        tp_size: Tensor parallel size. Use >1 to shard the model across
+                 multiple GPUs for faster generation.
+        gpu_id:  If set, pin vLLM to this specific GPU (for single-GPU vLLM
+                 alongside a training model on another GPU). Ignored if tp_size > 1.
     """
     from vllm import LLM
 
-    # Save and scrub DDP env vars so vLLM's subprocess starts clean
+    # Scrub DDP env vars to prevent EngineCore subprocess conflicts
     saved_env = {}
     for var in _DDP_ENV_VARS:
         if var in os.environ:
             saved_env[var] = os.environ.pop(var)
             print(f"[vLLM] Scrubbed env var {var}={saved_env[var]}")
 
-    print("[vLLM] Creating LLM engine...")
+    # Pin vLLM to a specific GPU if requested (only for tp_size=1)
+    saved_cuda_visible = None
+    if gpu_id is not None and tp_size == 1:
+        saved_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        print(f"[vLLM] Pinning to GPU {gpu_id} via CUDA_VISIBLE_DEVICES")
+
+    print(f"[vLLM] Creating LLM engine (tp_size={tp_size})...")
     try:
         llm = LLM(
             model=model_name,
@@ -272,18 +283,18 @@ def init_vllm_engine(
             max_model_len=max_model_len,
             enforce_eager=enforce_eager,
             dtype="bfloat16",
-            # Don't let vLLM try to use multi-GPU tensor parallel —
-            # we handle multi-GPU via DDP on the training side
-            tensor_parallel_size=1,
-            # Disable usage stats to avoid network calls
+            tensor_parallel_size=tp_size,
             disable_custom_all_reduce=True,
         )
         print("[vLLM] LLM engine created successfully")
     finally:
-        # Restore DDP env vars so the rest of training still works
+        # Restore env vars
         for var, val in saved_env.items():
             os.environ[var] = val
-            print(f"[vLLM] Restored env var {var}={val}")
+        if saved_cuda_visible is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = saved_cuda_visible
+        elif gpu_id is not None and tp_size == 1:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
     return llm
 
@@ -608,9 +619,7 @@ def main():
         "--use_vllm",
         action="store_true",
         help="Use vLLM for generation (faster inference). "
-        "Following the paper: merged weights for vLLM inference, "
-        "true LoRA model for training forward pass, "
-        "truncated importance sampling to correct mismatch.",
+        "Uses truncated importance sampling to correct for policy mismatch.",
     )
     parser.add_argument(
         "--vllm_gpu_ratio",
@@ -618,6 +627,21 @@ def main():
         default=0.4,
         help="Fraction of GPU memory for vLLM (default 0.4). "
         "The rest is used by the training model.",
+    )
+    parser.add_argument(
+        "--vllm_tp_size",
+        type=int,
+        default=1,
+        help="Tensor parallel size for vLLM. Use >1 to shard the model "
+        "across multiple GPUs for faster generation (e.g. 2, 4, 8). "
+        "No accelerate launch needed — just run with python directly.",
+    )
+    parser.add_argument(
+        "--vllm_gpu_id",
+        type=int,
+        default=None,
+        help="Pin vLLM to a specific GPU ID (e.g. 1 to put vLLM on GPU 1 "
+        "while training runs on GPU 0). Only used when tp_size=1.",
     )
     parser.add_argument(
         "--is_clip",
@@ -693,32 +717,31 @@ def main():
     # DDP wraps the model, but raw_model shares the same weights.
     raw_model = model
 
-    # ── Initialize vLLM engine (rank 0 only) ──
+    # ── Initialize vLLM engine ──
     vllm_engine = None
     if args.use_vllm:
         if accelerator.num_processes > 1:
             print(
                 "[vLLM] WARNING: Running with multiple DDP processes. "
-                "TinyLoRA has very few trainable params, so DDP provides "
-                "no benefit. Consider running with a single process: "
-                "python train_grpo.py --use_vllm ... (no accelerate launch)"
+                "This is not recommended with --use_vllm. Use --vllm_tp_size "
+                "instead to leverage multiple GPUs for generation: "
+                "python train_grpo.py --use_vllm --vllm_tp_size N"
             )
         if accelerator.is_main_process:
             print("[vLLM] Initializing vLLM engine for inference...")
             print(f"[vLLM] GPU memory utilization: {args.vllm_gpu_ratio}")
-            print(f"[vLLM] Importance sampling clip ratio: {args.is_clip}")
-            print(f"[vLLM] DDP world size: {accelerator.num_processes}")
-            print(f"[vLLM] CUDA device: {accelerator.device}")
+            print(f"[vLLM] Tensor parallel size: {args.vllm_tp_size}")
+            if args.vllm_gpu_id is not None:
+                print(f"[vLLM] Pinned to GPU: {args.vllm_gpu_id}")
             vllm_engine = init_vllm_engine(
                 model_name=args.model,
                 gpu_memory_utilization=args.vllm_gpu_ratio,
                 max_model_len=args.max_seq_len,
                 enforce_eager=True,
+                tp_size=args.vllm_tp_size,
+                gpu_id=args.vllm_gpu_id,
             )
             print("[vLLM] Engine initialized successfully")
-        # Sync all ranks — rank 1+ wait for rank 0 to finish vLLM init
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
 
     # ── Load data ──
     if accelerator.is_main_process:
@@ -778,43 +801,6 @@ def main():
                     if step % args.log_every == 0:
                         print(f"[vLLM][Step {step}] Generation complete")
 
-                # 4. Broadcast completions from rank 0 to all ranks
-                if torch.distributed.is_initialized():
-                    # Serialize completions for broadcast
-                    if accelerator.is_main_process:
-                        import pickle
-
-                        data = pickle.dumps((completions, gen_lengths))
-                        size_tensor = torch.tensor(
-                            [len(data)], dtype=torch.long, device=accelerator.device
-                        )
-                    else:
-                        size_tensor = torch.tensor(
-                            [0], dtype=torch.long, device=accelerator.device
-                        )
-
-                    torch.distributed.broadcast(size_tensor, src=0)
-
-                    if accelerator.is_main_process:
-                        data_tensor = torch.frombuffer(
-                            bytearray(data), dtype=torch.uint8
-                        ).to(accelerator.device)
-                    else:
-                        data_tensor = torch.empty(
-                            size_tensor.item(),
-                            dtype=torch.uint8,
-                            device=accelerator.device,
-                        )
-
-                    torch.distributed.broadcast(data_tensor, src=0)
-
-                    if not accelerator.is_main_process:
-                        import pickle
-
-                        data = bytes(data_tensor.cpu().numpy())
-                        completions, gen_lengths = pickle.loads(data)
-
-                    del data_tensor, size_tensor
 
                 # 5. Compute truncated importance sampling weights
                 #    We need log π_θ(y|x) / π_behavior(y|x) for each completion.
