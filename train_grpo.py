@@ -288,58 +288,12 @@ def init_vllm_engine(
     return llm
 
 
-def update_vllm_weights(llm, merged_state_dict: dict[str, torch.Tensor]):
-    """
-    Hot-swap vLLM's model weights with merged TinyLoRA weights.
-
-    In vLLM V1 (0.17+), the model runs in a separate EngineCore subprocess,
-    so we use collective_rpc("load_weights") to send the weights over IPC.
-    Falls back to the V0 API (model_executor.driver_worker) for older versions.
-    """
-    # Translate .W_frozen keys back to .weight for vLLM
-    translated = {}
-    for k, v in merged_state_dict.items():
-        new_key = k.replace(".W_frozen", ".weight")
-        # Skip TinyLoRA-specific buffers (U, S, V, P) that vLLM doesn't need
-        skip_suffixes = (".U", ".S", ".V", ".P")
-        if any(new_key.endswith(s) for s in skip_suffixes):
-            continue
-        translated[new_key] = v
-
-    # Move tensors to CPU for IPC serialization (collective_rpc uses pickle,
-    # which can't handle CUDA tensors directly)
-    weight_pairs = [(k, v.cpu()) for k, v in translated.items()]
-
-    # Try vLLM V1 API first (0.17+): collective_rpc sends to EngineCore subprocess
-    if hasattr(llm, "collective_rpc"):
-        try:
-            llm.collective_rpc("load_weights", args=(weight_pairs,))
-            return
-        except Exception as e:
-            print(f"[vLLM] collective_rpc('load_weights') failed: {e}")
-            print("[vLLM] Trying alternative weight update methods...")
-
-    # Try V0 API (direct model access, vLLM <0.17)
-    try:
-        runner = llm.llm_engine.model_executor.driver_worker.model_runner
-        runner.model.load_weights(weight_pairs)
-        return
-    except AttributeError:
-        pass
-
-    # Last resort: try iterating workers
-    try:
-        for worker in llm.llm_engine.model_executor.workers:
-            worker.model_runner.model.load_weights(weight_pairs)
-        return
-    except AttributeError:
-        pass
-
-    raise RuntimeError(
-        "[vLLM] Could not update model weights. "
-        f"vLLM version may be unsupported. "
-        f"LLM type: {type(llm)}, engine type: {type(llm.llm_engine)}"
-    )
+# NOTE: Weight hot-swapping was removed. vLLM V1 (0.17+) runs the model
+# in a separate EngineCore subprocess with no reliable public API for
+# in-memory weight updates. Instead, we initialize vLLM once with the
+# base model weights and rely on truncated importance sampling to correct
+# for the policy mismatch. With only 13 trainable params, TinyLoRA's
+# delta is tiny, so the IS correction is lightweight.
 
 
 @torch.no_grad()
@@ -805,21 +759,12 @@ def main():
             importance_weights = None
 
             if args.use_vllm:
-                # ── vLLM path: merge → generate → compute IS weights ──
+                # ── vLLM path: generate with base model, IS corrects mismatch ──
+                # vLLM uses base model weights (no hot-swap needed).
+                # The IS correction handles the gap between vLLM's policy
+                # (base model) and the true TinyLoRA policy.
 
-                # 1. Get merged state dict (non-destructive)
                 if accelerator.is_main_process:
-                    if step % args.log_every == 0:
-                        print(f"[vLLM][Step {step}] Computing merged state dict...")
-                    merged_sd = raw_model.get_merged_state_dict()
-
-                    # 2. Update vLLM engine weights
-                    if step % args.log_every == 0:
-                        print(f"[vLLM][Step {step}] Updating vLLM weights...")
-                    update_vllm_weights(vllm_engine, merged_sd)
-                    del merged_sd
-
-                    # 3. Generate with vLLM
                     if step % args.log_every == 0:
                         print(
                             f"[vLLM][Step {step}] Generating {len(prompts)}×{args.k} completions..."
@@ -872,17 +817,17 @@ def main():
                     del data_tensor, size_tensor
 
                 # 5. Compute truncated importance sampling weights
-                #    We need log π_θ(y|x) / π_merged(y|x) for each completion.
-                #    Since merged ≈ θ (both use same v, just numerical diff from
-                #    merge/unmerge), we compute behavior log-probs on the merged model
-                #    and target log-probs on the true LoRA model.
-                #
-                #    Key insight from the paper: the mismatch is purely numerical
-                #    (float precision from merge), so IS weights will be close to 1.
+                #    We need log π_θ(y|x) / π_behavior(y|x) for each completion.
+                #    Behavior policy = vLLM's base model (frozen weights, no LoRA delta).
+                #    Target policy = true TinyLoRA model (base + delta).
+                #    With 13 trainable params, the delta is tiny so IS weights ≈ 1.
 
-                # Compute behavior log-probs (merged model)
-                raw_model.merge()
-                merged_log_probs = compute_behavior_log_probs(
+                # Compute behavior log-probs (base model = vLLM's policy)
+                # Temporarily zero out v to simulate the base model
+                saved_vs = [v.data.clone() for v in raw_model.shared_vs]
+                for v in raw_model.shared_vs:
+                    v.data.zero_()
+                behavior_log_probs = compute_behavior_log_probs(
                     raw_model,
                     tokenizer,
                     prompts,
@@ -890,7 +835,9 @@ def main():
                     args.max_seq_len,
                     accelerator.device,
                 )
-                raw_model.unmerge()
+                # Restore v vectors
+                for v, saved in zip(raw_model.shared_vs, saved_vs):
+                    v.data.copy_(saved)
 
                 # Compute target log-probs (true LoRA model)
                 target_log_probs = compute_behavior_log_probs(
@@ -902,12 +849,12 @@ def main():
                     accelerator.device,
                 )
 
-                # IS weights with truncation: clip(exp(log_π_target - log_π_merged), 1/c, c)
+                # IS weights with truncation: clip(exp(log_π_target - log_π_behavior), 1/c, c)
                 importance_weights = []
-                for t_lps, m_lps in zip(target_log_probs, merged_log_probs):
+                for t_lps, b_lps in zip(target_log_probs, behavior_log_probs):
                     t_t = torch.tensor(t_lps, dtype=torch.float32)
-                    m_t = torch.tensor(m_lps, dtype=torch.float32)
-                    log_ratio = t_t - m_t
+                    b_t = torch.tensor(b_lps, dtype=torch.float32)
+                    log_ratio = t_t - b_t
                     # Truncated IS: clip to [1/c, c]
                     w = torch.exp(log_ratio).clamp(1.0 / args.is_clip, args.is_clip)
                     importance_weights.append(w.tolist())
